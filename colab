@@ -1,0 +1,476 @@
+# !pip install requests pandas numpy scikit-learn matplotlib seaborn
+
+import requests
+import json
+import pandas as pd
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Dict, List, Tuple
+import warnings
+warnings.filterwarnings('ignore')
+
+class LoLDataService:
+    def __init__(self):
+        self.base_url = 'https://ddragon.leagueoflegends.com'
+        self.current_version = None
+        self.champions_data = {}
+        self.items_data = {}
+
+    def get_latest_version(self) -> str:
+        """Get the latest game version"""
+        if self.current_version:
+            return self.current_version
+
+        try:
+            response = requests.get(f'{self.base_url}/api/versions.json')
+            versions = response.json()
+            self.current_version = versions[0]
+            print(f"Latest LoL version: {self.current_version}")
+            return self.current_version
+        except Exception as e:
+            print(f"Failed to fetch version: {e}")
+            return '15.12.1'  # Fallback
+
+    def fetch_champions_data(self) -> Dict:
+        """Fetch and process champions data"""
+        version = self.get_latest_version()
+
+        try:
+            url = f'{self.base_url}/cdn/{version}/data/en_US/champion.json'
+            response = requests.get(url)
+            data = response.json()
+
+            champions = {}
+            for key, champion in data['data'].items():
+                # Map champion data to our format
+                champions[champion['name']] = {
+                    'id': champion['id'],
+                    'name': champion['name'],
+                    'title': champion['title'],
+                    'role': self._map_champion_role(champion['tags']),
+                    'damage_type': self._get_damage_type(champion['info']),
+                    'playstyle': self._get_playstyle(champion['tags']),
+                    'scaling': self._get_scaling(champion['info']),
+                    'difficulty': champion['info']['difficulty'],
+                    'attack': champion['info']['attack'],
+                    'defense': champion['info']['defense'],
+                    'magic': champion['info']['magic'],
+                    'tags': champion['tags']
+                }
+
+            self.champions_data = champions
+            print(f"Loaded {len(champions)} champions")
+            return champions
+
+        except Exception as e:
+            print(f"Failed to fetch champions: {e}")
+            return {}
+
+    def fetch_items_data(self) -> Dict:
+        """Fetch and process items data"""
+        version = self.get_latest_version()
+
+        try:
+            url = f'{self.base_url}/cdn/{version}/data/en_US/item.json'
+            response = requests.get(url)
+            data = response.json()
+
+            items = {}
+            for item_id, item in data['data'].items():
+                # Skip unwanted items
+                if self._should_skip_item(item):
+                    continue
+
+                items[item['name']] = {
+                    'id': item_id,
+                    'name': item['name'],
+                    'description': item.get('plaintext', item.get('description', '')),
+                    'cost': item['gold']['total'],
+                    'category': self._categorize_item(item),
+                    'stats': self._extract_stats(item.get('stats', {})),
+                    'roles': self._infer_roles(item),
+                    'phase': self._infer_game_phase(item),
+                    'playstyles': self._infer_playstyles(item),
+                    'tags': item.get('tags', [])
+                }
+
+            self.items_data = items
+            print(f"Loaded {len(items)} items")
+            return items
+
+        except Exception as e:
+            print(f"Failed to fetch items: {e}")
+            return {}
+
+    def _map_champion_role(self, tags: List[str]) -> str:
+        """Map champion tags to primary role"""
+        role_mapping = {
+            'Marksman': 'ADC',
+            'Mage': 'Mid',
+            'Assassin': 'Mid',
+            'Support': 'Support',
+            'Tank': 'Top',
+            'Fighter': 'Top'
+        }
+
+        for tag in tags:
+            if tag in role_mapping:
+                return role_mapping[tag]
+        return 'Jungle'
+
+    def _get_damage_type(self, info: Dict) -> str:
+        """Determine primary damage type"""
+        return 'Magic' if info['magic'] > info['attack'] else 'Physical'
+
+    def _get_playstyle(self, tags: List[str]) -> str:
+        """Determine playstyle from tags"""
+        playstyle_mapping = {
+            'Assassin': 'Assassin',
+            'Marksman': 'Hypercarry',
+            'Mage': 'Burst',
+            'Support': 'Utility',
+            'Tank': 'Tank',
+            'Fighter': 'Bruiser'
+        }
+
+        for tag in tags:
+            if tag in playstyle_mapping:
+                return playstyle_mapping[tag]
+        return 'Control'
+
+    def _get_scaling(self, info: Dict) -> str:
+        """Determine scaling pattern"""
+        total = info['attack'] + info['defense'] + info['magic']
+        if info['attack'] > total * 0.4:
+            return 'Early'
+        elif info['magic'] > total * 0.4:
+            return 'Mid'
+        return 'Late'
+
+    def _should_skip_item(self, item: Dict) -> bool:
+        """Check if item should be skipped"""
+        skip_tags = ['Boots', 'Consumable', 'GoldPer', 'Trinket']
+        skip_names = ['Health Potion', 'Mana Potion', 'Ward']
+
+        item_tags = item.get('tags', [])
+        item_name = item['name']
+
+        return (any(tag in item_tags for tag in skip_tags) or
+                any(name in item_name for name in skip_names) or
+                item['gold']['total'] < 400)
+
+    def _categorize_item(self, item: Dict) -> str:
+        """Categorize item based on stats"""
+        stats = item.get('stats', {})
+
+        if (stats.get('FlatHPPoolMod', 0) > 300 or
+            stats.get('FlatArmorMod', 0) > 40 or
+            stats.get('FlatSpellBlockMod', 0) > 40):
+            return 'Defense'
+        elif (stats.get('FlatPhysicalDamageMod', 0) > 40 or
+              stats.get('FlatMagicDamageMod', 0) > 60):
+            return 'Damage'
+        elif (stats.get('PercentLifeStealMod', 0) > 0 or
+              'heal' in item['name'].lower()):
+            return 'Sustain'
+        return 'Utility'
+
+    def _extract_stats(self, stats: Dict) -> List[str]:
+        """Extract readable stat names"""
+        stat_mapping = {
+            'FlatPhysicalDamageMod': 'AD',
+            'FlatMagicDamageMod': 'AP',
+            'FlatHPPoolMod': 'Health',
+            'FlatMPPoolMod': 'Mana',
+            'FlatArmorMod': 'Armor',
+            'FlatSpellBlockMod': 'MR',
+            'FlatCritChanceMod': 'Crit',
+            'PercentAttackSpeedMod': 'AS',
+            'PercentLifeStealMod': 'Lifesteal'
+        }
+
+        return [stat_mapping[key] for key in stats.keys()
+                if key in stat_mapping and stats[key] > 0]
+
+    def _infer_roles(self, item: Dict) -> List[str]:
+        """Infer suitable roles for item"""
+        stats = item.get('stats', {})
+        roles = []
+
+        if (stats.get('FlatPhysicalDamageMod', 0) > 30 or
+            stats.get('FlatCritChanceMod', 0) > 0):
+            roles.extend(['ADC', 'Top'])
+        if stats.get('FlatMagicDamageMod', 0) > 40:
+            roles.extend(['Mid', 'Support'])
+        if stats.get('FlatHPPoolMod', 0) > 200:
+            roles.extend(['Top', 'Jungle', 'Support'])
+
+        return list(set(roles)) if roles else ['Top', 'Mid', 'ADC', 'Support', 'Jungle']
+
+    def _infer_game_phase(self, item: Dict) -> List[str]:
+        """Infer suitable game phases"""
+        cost = item['gold']['total']
+        if cost < 1200:
+            return ['early']
+        elif cost < 2800:
+            return ['early', 'mid']
+        return ['mid', 'late']
+
+    def _infer_playstyles(self, item: Dict) -> List[str]:
+        """Infer suitable playstyles"""
+        stats = item.get('stats', {})
+        playstyles = []
+
+        if stats.get('FlatCritChanceMod', 0) > 0:
+            playstyles.append('Hypercarry')
+        if stats.get('FlatPhysicalDamageMod', 0) > 50:
+            playstyles.append('Assassin')
+        if stats.get('FlatMagicDamageMod', 0) > 80:
+            playstyles.append('Burst')
+        if stats.get('FlatHPPoolMod', 0) > 400:
+            playstyles.append('Tank')
+        if ('heal' in item['name'].lower() or 'shield' in item['name'].lower()):
+            playstyles.append('Enchanter')
+
+        return playstyles if playstyles else ['Control']
+
+class LoLItemRecommender:
+    def __init__(self):
+        self.data_service = LoLDataService()
+        self.champions = {}
+        self.items = {}
+        self.feature_matrix = None
+        self.item_names = []
+
+    def load_data(self):
+        """Load champions and items data"""
+        print("Fetching League of Legends data...")
+        self.champions = self.data_service.fetch_champions_data()
+        self.items = self.data_service.fetch_items_data()
+        self._create_feature_matrix()
+
+    def _create_feature_matrix(self):
+        """Create feature matrix for similarity calculations"""
+        if not self.items:
+            return
+
+        # Create feature vectors for items
+        features = []
+        self.item_names = list(self.items.keys())
+
+        # Define feature categories
+        roles = ['ADC', 'Mid', 'Top', 'Support', 'Jungle']
+        phases = ['early', 'mid', 'late']
+        categories = ['Damage', 'Defense', 'Utility', 'Sustain']
+        playstyles = ['Hypercarry', 'Assassin', 'Burst', 'Tank', 'Enchanter', 'Control', 'Bruiser', 'Utility']
+
+        for item_name in self.item_names:
+            item = self.items[item_name]
+            feature_vector = []
+
+            # Role features
+            feature_vector.extend([1 if role in item['roles'] else 0 for role in roles])
+
+            # Phase features
+            feature_vector.extend([1 if phase in item['phase'] else 0 for phase in phases])
+
+            # Category features
+            feature_vector.extend([1 if cat == item['category'] else 0 for cat in categories])
+
+            # Playstyle features
+            feature_vector.extend([1 if style in item['playstyles'] else 0 for style in playstyles])
+
+            # Cost feature (normalized)
+            feature_vector.append(item['cost'] / 4000.0)  # Normalize by max typical cost
+
+            features.append(feature_vector)
+
+        self.feature_matrix = np.array(features)
+        print(f"Created feature matrix: {self.feature_matrix.shape}")
+
+    def calculate_similarity(self, champion_name: str, game_phase: str = 'mid') -> List[Tuple[str, float]]:
+        """Calculate item similarity scores for a champion"""
+        if champion_name not in self.champions:
+            print(f"Champion '{champion_name}' not found!")
+            return []
+
+        champion = self.champions[champion_name]
+
+        # Create champion preference vector
+        roles = ['ADC', 'Mid', 'Top', 'Support', 'Jungle']
+        phases = ['early', 'mid', 'late']
+        categories = ['Damage', 'Defense', 'Utility', 'Sustain']
+        playstyles = ['Hypercarry', 'Assassin', 'Burst', 'Tank', 'Enchanter', 'Control', 'Bruiser', 'Utility']
+
+        champion_vector = []
+
+        # Role preferences
+        champion_vector.extend([3 if role == champion['role'] else 0 for role in roles])
+
+        # Phase preferences
+        champion_vector.extend([3 if phase == game_phase else 1 for phase in phases])
+
+        # Category preferences (based on champion type)
+        damage_pref = 3 if champion['damage_type'] == 'Physical' else 1
+        magic_pref = 3 if champion['damage_type'] == 'Magic' else 1
+        champion_vector.extend([damage_pref, 1, 1, 1])  # Damage, Defense, Utility, Sustain
+
+        # Playstyle preferences
+        champion_vector.extend([3 if style == champion['playstyle'] else 0 for style in playstyles])
+
+        # Cost preference (varies by phase)
+        cost_pref = {'early': 0.3, 'mid': 0.6, 'late': 1.0}[game_phase]
+        champion_vector.append(cost_pref)
+
+        # Calculate similarities
+        champion_vector = np.array(champion_vector).reshape(1, -1)
+        similarities = cosine_similarity(champion_vector, self.feature_matrix)[0]
+
+        # Create scored recommendations
+        recommendations = [(self.item_names[i], similarities[i]) for i in range(len(similarities))]
+        recommendations.sort(key=lambda x: x[1], reverse=True)
+
+        return recommendations
+
+    def recommend_items(self, champion_name: str, game_phase: str = 'mid', top_k: int = 10):
+        """Get top item recommendations for a champion"""
+        recommendations = self.calculate_similarity(champion_name, game_phase)
+
+        if not recommendations:
+            return
+
+        print(f"\n🎯 Top {top_k} Item Recommendations for {champion_name} ({game_phase} game):")
+        print("=" * 60)
+
+        for i, (item_name, score) in enumerate(recommendations[:top_k]):
+            item = self.items[item_name]
+            print(f"{i+1:2d}. {item_name}")
+            print(f"    💰 Cost: {item['cost']}g | 📊 Score: {score:.3f}")
+            print(f"    📝 {item['description'][:80]}...")
+            print(f"    🏷️  Stats: {', '.join(item['stats'])}")
+            print(f"    🎲 Category: {item['category']} | Roles: {', '.join(item['roles'][:3])}")
+            print()
+
+    def analyze_champion(self, champion_name: str):
+        """Analyze champion characteristics"""
+        if champion_name not in self.champions:
+            print(f"Champion '{champion_name}' not found!")
+            return
+
+        champion = self.champions[champion_name]
+        print(f"\n🏆 Champion Analysis: {champion_name}")
+        print("=" * 50)
+        print(f"Title: {champion['title']}")
+        print(f"Primary Role: {champion['role']}")
+        print(f"Damage Type: {champion['damage_type']}")
+        print(f"Playstyle: {champion['playstyle']}")
+        print(f"Scaling: {champion['scaling']}")
+        print(f"Difficulty: {champion['difficulty']}/10")
+        print(f"Attack: {champion['attack']}/10")
+        print(f"Defense: {champion['defense']}/10")
+        print(f"Magic: {champion['magic']}/10")
+        print(f"Tags: {', '.join(champion['tags'])}")
+
+    def visualize_recommendations(self, champion_name: str, game_phase: str = 'mid', top_k: int = 15):
+        """Visualize item recommendations"""
+        recommendations = self.calculate_similarity(champion_name, game_phase)
+
+        if not recommendations:
+            return
+
+        # Prepare data for visualization
+        top_items = recommendations[:top_k]
+        item_names = [item[0] for item in top_items]
+        scores = [item[1] for item in top_items]
+        categories = [self.items[name]['category'] for name in item_names]
+        costs = [self.items[name]['cost'] for name in item_names]
+
+        # Create subplots
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+        fig.suptitle(f'Item Recommendations for {champion_name} ({game_phase} game)', fontsize=16)
+
+        # 1. Similarity scores bar chart
+        ax1.barh(range(len(item_names)), scores, color='skyblue')
+        ax1.set_yticks(range(len(item_names)))
+        ax1.set_yticklabels([name[:15] + '...' if len(name) > 15 else name for name in item_names])
+        ax1.set_xlabel('Similarity Score')
+        ax1.set_title('Top Item Recommendations')
+        ax1.invert_yaxis()
+
+        # 2. Category distribution
+        category_counts = pd.Series(categories).value_counts()
+        ax2.pie(category_counts.values, labels=category_counts.index, autopct='%1.1f%%', startangle=90)
+        ax2.set_title('Recommended Items by Category')
+
+        # 3. Cost vs Score scatter
+        ax3.scatter(costs, scores, c=[plt.cm.Set3(i) for i in range(len(costs))], s=100, alpha=0.7)
+        ax3.set_xlabel('Item Cost (Gold)')
+        ax3.set_ylabel('Similarity Score')
+        ax3.set_title('Cost vs Recommendation Score')
+
+        # Add item names as annotations
+        for i, name in enumerate(item_names):
+            if i < 8:  # Only annotate top 8 to avoid clutter
+                ax3.annotate(name[:10], (costs[i], scores[i]), xytext=(5, 5),
+                           textcoords='offset points', fontsize=8)
+
+        # 4. Cost distribution
+        ax4.hist(costs, bins=10, alpha=0.7, color='lightgreen', edgecolor='black')
+        ax4.set_xlabel('Item Cost (Gold)')
+        ax4.set_ylabel('Number of Items')
+        ax4.set_title('Cost Distribution of Recommended Items')
+
+        plt.tight_layout()
+        plt.show()
+
+    def compare_champions(self, champion1: str, champion2: str, game_phase: str = 'mid'):
+        """Compare item recommendations between two champions"""
+        recs1 = self.calculate_similarity(champion1, game_phase)[:10]
+        recs2 = self.calculate_similarity(champion2, game_phase)[:10]
+
+        items1 = set([item[0] for item in recs1])
+        items2 = set([item[0] for item in recs2])
+
+        common_items = items1.intersection(items2)
+        unique1 = items1 - items2
+        unique2 = items2 - items1
+
+        print(f"\n🔄 Item Recommendation Comparison: {champion1} vs {champion2}")
+        print("=" * 60)
+        print(f"Common items ({len(common_items)}): {', '.join(list(common_items)[:5])}")
+        print(f"{champion1} unique ({len(unique1)}): {', '.join(list(unique1)[:5])}")
+        print(f"{champion2} unique ({len(unique2)}): {', '.join(list(unique2)[:5])}")
+
+# Usage Example
+def main():
+    # Initialize recommender
+    recommender = LoLItemRecommender()
+    recommender.load_data()
+
+    # Example usage
+    champion = "Ahri"
+
+    # Analyze champion
+    recommender.analyze_champion(champion)
+
+    # Get recommendations for different phases
+    for phase in ['early', 'mid', 'late']:
+        recommender.recommend_items(champion, phase, top_k=5)
+
+    # Visualize recommendations
+    recommender.visualize_recommendations(champion, 'mid', top_k=12)
+
+    # Compare with another champion
+    recommender.compare_champions("Akali", "Ahri", "mid")
+
+    # Show available champions
+    print(f"\n📋 Available Champions ({len(recommender.champions)}):")
+    champion_list = list(recommender.champions.keys())
+    for i in range(0, len(champion_list), 5):
+        print(", ".join(champion_list[i:i+5]))
+
+if __name__ == "__main__":
+    main()
